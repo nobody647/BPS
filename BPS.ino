@@ -3,31 +3,60 @@
 // clang-format off
 #ifdef DEBUG_MODE
 #define DEBUG_PRINT(x) Serial.println(x)
+#define DEBUG_PRINT_FRAME(x) print_frame(x)
 #else
 #define DEBUG_PRINT(x)	do {} while (0)
+#define DEBUG_PRINT_FRAME(x) do {} while (0)
 #endif
 // clang-format on
 
-#include "pin_defs.h"
+#include "defs.h"
+
 #include <DueTimer.h>  //time0 is used for 60 second precharge period, timer1 is 1hz led blink
 #include <due_can.h>
+
 #include <stdint.h>  //includes types i like, luke uint8_t, uint16_t, etc.
 
-// baud rate used for can. kinda self-explanitory tbh
-#define CAN_BAUD 125000
+#include <vector>  // not using vectors, just std::begin();
+using std::begin;
+using std::end;
 
 // type that represens the state of the program. during charging, program is in
 // off state
 enum State { OFF, PRECHARGE, READY, ERROR };
 volatile State state = OFF;
 
+/**
+ * i'll put a comment here to explain this later
+ */
+// pack
+size_t pack_index; // index to insert
+volatile pack_t pack_data[DATA_POINTS_TO_STORE]; // array storing data temporarily
+
+// voltage
+size_t hv_index = 0;
+size_t lv_index = 0;
+volatile voltage_t hv_data[DATA_POINTS_TO_STORE];
+volatile voltage_t lv_data[DATA_POINTS_TO_STORE];
+
+// temp
+size_t temp_index = 0;
+volatile temp_t temp_data[DATA_POINTS_TO_STORE];
+
 // if i don't declare these my linter freaks out. does nothing
 void __disable_irq();
 void __enable_irq();
 
+/**
+ * 
+ * INTERRUPT HANDLERS
+ * 
+ */
+
+
 // begins the precharge process
 // called when switch flipped
-void flip_on() {
+void flip_on_handler() {
 	noInterrupts();
 	DEBUG_PRINT("Precharge switch has been flipped!");
 	enter_precharge();
@@ -36,7 +65,7 @@ void flip_on() {
 
 // turns off power and sets off state
 // called when switch flipped
-void flip_off() {
+void flip_off_handler() {
 	noInterrupts();
 	DEBUG_PRINT("Precharge switch flipped off!");
 	enter_off();
@@ -45,16 +74,27 @@ void flip_off() {
 
 // enters ready state
 // called when timer0 expires after 60s of precharge
-void timer0_finish() {
+void precharge_timer_handler() {
 	noInterrupts();
 	DEBUG_PRINT("Timer0 expired! Attempting to enter ready state");
 	enter_ready();
 	interrupts();
 }
 
+// during the precharge sequence, the precharge LED blinks to let us know that
+// it's working
+void blink_timer_handler() { digitalWrite(PRECHARGE_LED, !digitalRead(PRECHARGE_LED)); }
+
+
+void pack_status_handler(CAN_FRAME* frame) {}
+
+void hilo_volts_handler(CAN_FRAME* frame) {}
+
+void temp_dtc_handler(CAN_FRAME* frame) {}
+
 /*
  *
- * state change functions
+ * STATE CHANGE FUNCTIONS
  *
  */
 
@@ -176,9 +216,55 @@ void isolate_pack() {
 	DEBUG_PRINT("Relays have been set to open/disconnected state!");
 }
 
-// during the precharge sequence, the precharge LED blinks to let us know that
-// it's working
-void blink_led() { digitalWrite(PRECHARGE_LED, !digitalRead(PRECHARGE_LED)); }
+// stolen from ross
+void print_frame(CAN_FRAME* frame) {  // this is good for testing to see if you are getting the
+									  // right values before conversion
+	Serial.print("ID: 0x");
+	Serial.print(frame->id, HEX);
+	Serial.print(" Len: ");
+	Serial.print(frame->length);
+	Serial.print(" Data: 0x");
+	for (int count = 0; count < frame->length; count++) {
+		Serial.print(frame->data.bytes[count], HEX);
+		Serial.print(" ");
+	}
+	Serial.print("\r\n");
+}
+
+bool is_pack_ok(pack_t d){
+	if(d.current > CURRENT_LIMIT){
+		return false;
+	}
+	if((millis() - d.timestamp) > AGE_LIMIT){
+		return false;
+	}
+
+	return true;
+}
+bool is_voltage_ok(voltage_t d){
+	if(d.voltage > HIGH_VOLTAGE_LIMIT){
+		return false;
+	}
+	if(d.voltage < LOW_VOLTAGE_LIMIT){
+		return false;
+	}
+	if((millis() - d.timestamp) > AGE_LIMIT){
+		return false;
+	}
+
+	return true;
+}
+bool is_temp_ok(temp_t d){
+	if(d.temp > TEMP_LIMIT){
+		return false;
+	}
+	if((millis() - d.timestamp) > AGE_LIMIT){
+		return false;
+	}
+
+	return true;
+}
+
 
 void setup() {
 	noInterrupts();  // disable interrupts for critical code
@@ -199,18 +285,21 @@ void setup() {
 	DEBUG_PRINT("Pins configured!");
 
 	// Configure timers and interrupts
-	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_on, FALLING);
-	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_off, RISING);
+	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_on_handler, FALLING);
+	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_off_handler, RISING);
 	// DueTimer t = DueTimer(2);
-	Timer0.attachInterrupt(enter_ready)
-		.setPeriod(60000);  // 60 seconds for precharge timer
-	Timer1.attachInterrupt(blink_led).setPeriod(
-		1000);  // 1 second for led blink
+	Timer0.attachInterrupt(precharge_timer_handler).setPeriod(60000);  // 60 seconds for precharge timer
+	Timer1.attachInterrupt(blink_timer_handler).setPeriod(1000);	   // 1 second for led blink
 	DEBUG_PRINT("Interrupts configured!");
 
 	// Begin CAN connection
 	Can0.begin(CAN_BAUD);
-	// TODO: ADD CAN STUFF
+	Can0.setRXFilter(0, BMS_CAN_BASE | PACK_STATUS, false);
+	Can0.setRXFilter(1, BMS_CAN_BASE | HILO_VOLTS, false);
+	Can0.setRXFilter(2, BMS_CAN_BASE | TEMP_DTC, false);
+	Can0.setCallback(0, pack_status_handler);
+	Can0.setCallback(0, hilo_volts_handler);
+	Can0.setCallback(0, temp_dtc_handler);
 
 	interrupts();  // enable interrupts
 }
