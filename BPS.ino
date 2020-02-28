@@ -17,9 +17,7 @@
 
 #include <stdint.h>  //includes types i like, luke uint8_t, uint16_t, etc.
 
-#include <vector>  // not using vectors, just std::begin();
-using std::begin;
-using std::end;
+#include <algorithm>
 
 // type that represens the state of the program. during charging, program is in
 // off state
@@ -30,17 +28,17 @@ volatile State state = OFF;
  * i'll put a comment here to explain this later
  */
 // pack
-size_t pack_index; // index to insert
-volatile pack_t pack_data[DATA_POINTS_TO_STORE]; // array storing data temporarily
+volatile size_t pack_index;								// index to insert
+pack_t pack_data[DATA_POINTS_TO_STORE] = {0};  // array storing data temporarily
 
 // voltage
-size_t hv_index = 0;
-size_t lv_index = 0;
+volatile size_t hv_index = 0;
+volatile size_t lv_index = 0;
 volatile voltage_t hv_data[DATA_POINTS_TO_STORE];
 volatile voltage_t lv_data[DATA_POINTS_TO_STORE];
 
 // temp
-size_t temp_index = 0;
+volatile size_t temp_index = 0;
 volatile temp_t temp_data[DATA_POINTS_TO_STORE];
 
 // if i don't declare these my linter freaks out. does nothing
@@ -48,11 +46,10 @@ void __disable_irq();
 void __enable_irq();
 
 /**
- * 
+ *
  * INTERRUPT HANDLERS
- * 
+ *
  */
-
 
 // begins the precharge process
 // called when switch flipped
@@ -85,8 +82,21 @@ void precharge_timer_handler() {
 // it's working
 void blink_timer_handler() { digitalWrite(PRECHARGE_LED, !digitalRead(PRECHARGE_LED)); }
 
+void pack_status_handler(CAN_FRAME* frame) {
+	pack_t data;
+	data.current = frame->data.s0;
+	data.voltage = frame->data.s1;
+	data.soc = frame->data.byte[4];
 
-void pack_status_handler(CAN_FRAME* frame) {}
+	// relay state is not on a short/halfword boundary
+	// need to use bitwise operators. TODO: make sure endianness is correct
+	data.soc = frame->data.byte[5];
+	data.soc |= (frame->data.byte[6] << 8);
+
+	pack_data[pack_index] = data;
+	pack_index ++;
+	pack_index %= DATA_POINTS_TO_STORE;
+}
 
 void hilo_volts_handler(CAN_FRAME* frame) {}
 
@@ -231,44 +241,89 @@ void print_frame(CAN_FRAME* frame) {  // this is good for testing to see if you 
 	Serial.print("\r\n");
 }
 
-bool is_pack_ok(pack_t d){
-	if(d.current > CURRENT_LIMIT){
-		return false;
+bool is_pack_bad(const pack_t& d) {
+	if (d.current > CURRENT_LIMIT) {
+		DEBUG_PRINT("Pack current high!");
+		return true;
 	}
-	if((millis() - d.timestamp) > AGE_LIMIT){
-		return false;
+	if ((millis() - d.timestamp) > AGE_LIMIT) {
+		DEBUG_PRINT("Pack data old!");
+		return true;
 	}
 
-	return true;
+	return false;
 }
-bool is_voltage_ok(voltage_t d){
-	if(d.voltage > HIGH_VOLTAGE_LIMIT){
-		return false;
+bool is_voltage_bad(const voltage_t& d) {
+	if (d.voltage > HIGH_VOLTAGE_LIMIT) {
+		DEBUG_PRINT("Module voltage high!");
+		DEBUG_PRINT(d.module_id);
+		return true;
 	}
-	if(d.voltage < LOW_VOLTAGE_LIMIT){
-		return false;
+	if (d.voltage < LOW_VOLTAGE_LIMIT) {
+		DEBUG_PRINT("Module voltage low!");
+		DEBUG_PRINT(d.module_id);
+		return true;
 	}
-	if((millis() - d.timestamp) > AGE_LIMIT){
-		return false;
+	if ((millis() - d.timestamp) > AGE_LIMIT) {
+		DEBUG_PRINT("Voltage data old!");
+		return true;
 	}
 
-	return true;
+	return false;
 }
-bool is_temp_ok(temp_t d){
-	if(d.temp > TEMP_LIMIT){
-		return false;
+bool is_temp_bad(const temp_t& d) {
+	if (d.temp > TEMP_LIMIT) {
+		DEBUG_PRINT("Temp high!");
+		DEBUG_PRINT(d.therm_id);
+		return true;
 	}
-	if((millis() - d.timestamp) > AGE_LIMIT){
-		return false;
+	if ((millis() - d.timestamp) > AGE_LIMIT) {
+		DEBUG_PRINT("Temp data old!");
+		return true;
 	}
 
-	return true;
+	return false;
 }
 
+/**
+ *
+ * pretty self explanitory
+ *
+ */
+void check_measurements() {
+	DEBUG_PRINT("Checking measurements...");
+	size_t error_count = 0;
+
+	error_count = std::count_if(pack_data, &pack_data[DATA_POINTS_TO_STORE - 1], is_pack_bad);
+	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
+		DEBUG_PRINT("Too many errors on pack!");
+		enter_error();
+	}
+
+	error_count = std::count_if(hv_data, &hv_data[DATA_POINTS_TO_STORE - 1], is_voltage_bad);
+	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
+		DEBUG_PRINT("Too many errors on overvoltage!");
+		enter_error();
+	}
+
+	error_count = std::count_if(lv_data, &lv_data[DATA_POINTS_TO_STORE - 1], is_voltage_bad);
+	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
+		DEBUG_PRINT("Too many errors on undervoltage!");
+		enter_error();
+	}
+	
+	error_count = std::count_if(temp_data, &temp_data[DATA_POINTS_TO_STORE - 1], is_temp_bad);
+	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
+		DEBUG_PRINT("Too many errors on temp!");
+		enter_error();
+	}
+
+	DEBUG_PRINT("Done checking measurements!");
+}
 
 void setup() {
 	noInterrupts();  // disable interrupts for critical code
-#ifdef DEBUG
+#ifdef DEBUG_MODE
 	// Set up serial connection
 	Serial.begin(57600);
 	Serial.println("Hello world!");
@@ -321,4 +376,6 @@ void loop() {
 		}
 	}
 #endif
+
+
 }
