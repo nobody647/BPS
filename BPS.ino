@@ -24,23 +24,6 @@
 enum State { OFF, PRECHARGE, READY, ERROR };
 volatile State state = OFF;
 
-/**
- * i'll put a comment here to explain this later
- */
-// pack
-volatile size_t pack_index;								// index to insert
-pack_t pack_data[DATA_POINTS_TO_STORE] = {0};  // array storing data temporarily
-
-// voltage
-volatile size_t hv_index = 0;
-volatile size_t lv_index = 0;
-volatile voltage_t hv_data[DATA_POINTS_TO_STORE];
-volatile voltage_t lv_data[DATA_POINTS_TO_STORE];
-
-// temp
-volatile size_t temp_index = 0;
-volatile temp_t temp_data[DATA_POINTS_TO_STORE];
-
 // if i don't declare these my linter freaks out. does nothing
 void __disable_irq();
 void __enable_irq();
@@ -80,27 +63,96 @@ void precharge_timer_handler() {
 
 // during the precharge sequence, the precharge LED blinks to let us know that
 // it's working
-void blink_timer_handler() { digitalWrite(PRECHARGE_LED, !digitalRead(PRECHARGE_LED)); }
-
-void pack_status_handler(CAN_FRAME* frame) {
-	pack_t data;
-	data.current = frame->data.s0;
-	data.voltage = frame->data.s1;
-	data.soc = frame->data.byte[4];
-
-	// relay state is not on a short/halfword boundary
-	// need to use bitwise operators. TODO: make sure endianness is correct
-	data.soc = frame->data.byte[5];
-	data.soc |= (frame->data.byte[6] << 8);
-
-	pack_data[pack_index] = data;
-	pack_index ++;
-	pack_index %= DATA_POINTS_TO_STORE;
+void blink_timer_handler() {
+	noInterrupts();
+	digitalWrite(PRECHARGE_LED, !digitalRead(PRECHARGE_LED));
+	interrupts();
 }
 
-void hilo_volts_handler(CAN_FRAME* frame) {}
+void pack_status_handler(CAN_FRAME* frame) {
+	noInterrupts();
+	DEBUG_PRINT("Received pack frame!");
+	DEBUG_PRINT_FRAME(frame);
+	const uint16_t current = frame->data.s0;
+	if (current > CURRENT_LIMIT) {
+		DEBUG_PRINT("Current too high!");
+		enter_error();
+	}
 
-void temp_dtc_handler(CAN_FRAME* frame) {}
+	// service "watchdog" timer
+	Timer2.setPeriod(AGE_LIMIT);
+	Timer2.start();
+	interrupts();
+}
+
+void hilo_volts_handler(CAN_FRAME* frame) {
+	noInterrupts();
+	DEBUG_PRINT("Received voltage frame!");
+	DEBUG_PRINT_FRAME(frame);
+	const uint16_t high_value = frame->data.s0;
+	if (high_value > HIGH_VOLTAGE_LIMIT) {
+		const uint8_t high_module = frame->data.bytes[2];
+		DEBUG_PRINT("Voltage too high!");
+		DEBUG_PRINT(high_value);
+		DEBUG_PRINT(high_module);
+		enter_error();
+	}
+
+	// data is not aligned with word boundary, we need to do some bit shifting
+	const uint16_t low_value = frame->data.bytes[4] |= (frame->data.bytes[3] << 8);
+	if (low_value < LOW_VOLTAGE_LIMIT) {
+		const uint8_t low_module = frame->data.bytes[5];
+		DEBUG_PRINT("Voltage too low!");
+		DEBUG_PRINT(low_value);
+		DEBUG_PRINT(low_module);
+		enter_error();
+	}
+
+	// service watchdog timer
+	Timer3.setPeriod(AGE_LIMIT);
+	Timer3.start();
+	interrupts();
+}
+
+void temp_dtc_handler(CAN_FRAME* frame) {
+	noInterrupts();
+	DEBUG_PRINT("Received temp frame!");
+	DEBUG_PRINT_FRAME(frame);
+	const uint8_t high_temp = frame->data.bytes[0];
+	if (high_temp > TEMP_LIMIT) {
+		const uint8_t high_module = frame->data.bytes[2];
+		DEBUG_PRINT("Temp too high!");
+		DEBUG_PRINT(high_temp);
+		DEBUG_PRINT(high_module);
+		enter_error();
+	}
+
+	// service watchdog timer
+	Timer4.setPeriod(AGE_LIMIT);
+	Timer4.start();
+	interrupts();
+}
+
+void pack_watchdog_handler() {
+	noInterrupts();
+	DEBUG_PRINT("Pack watchdog expired! We haven't received any pack data in too long!");
+	enter_error();
+	interrupts();
+}
+
+void voltage_watchdog_handler() {
+	noInterrupts();
+	DEBUG_PRINT("Voltage watchdog expired! We haven't received any voltage data in too long!");
+	enter_error();
+	interrupts();
+}
+
+void temp_watchdog_handler() {
+	noInterrupts();
+	DEBUG_PRINT("Temp watchdog expired! We haven't received any temp data in too long!");
+	enter_error();
+	interrupts();
+}
 
 /*
  *
@@ -134,6 +186,11 @@ void enter_precharge() {
 
 	Timer1.start();  // start the timer that blinks the precharge led
 
+	// starts "watchdog" timers
+	Timer2.start();
+	Timer3.start();
+	Timer4.start();
+
 	state = PRECHARGE;
 	DEBUG_PRINT("Timers started and state set to precharge!");
 }
@@ -157,15 +214,18 @@ void enter_ready() {
 		return;
 	}
 
+	// close relays
 	digitalWrite(RELAY1_LOW_SIDE, HIGH);
 	digitalWrite(RELAY2_HIGH_SIDE, HIGH);
 	digitalWrite(RELAY3_PRECHARGE, HIGH);
 	digitalWrite(RELAY4_MPPT, HIGH);
 	DEBUG_PRINT("Relays configured for ON state!");
 
+	// set timers to correct state
 	reset_timers();
 	digitalWrite(PRECHARGE_LED, HIGH);
 
+	// change program state
 	state = READY;
 	DEBUG_PRINT("TImers and state configured for ON state!");
 
@@ -208,11 +268,19 @@ void enter_error() {
 void reset_timers() {
 	// stop countdown to end of precharge sequence if it has been started
 	Timer0.stop();
-	Timer0.setPeriod(60000);
+	Timer0.setPeriod(10000);
 
 	// stop precharge LED blinking if it is
 	Timer1.stop();
 	digitalWrite(PRECHARGE_LED, LOW);
+
+	// reset age limit watchdog timers
+	Timer2.stop();
+	Timer.setPeriod(AGE_LIMIT);
+	Timer3.stop();
+	Timer3.setPeriod(AGE_LIMIT);
+	Timer4.stop();
+	Timer4.setPeriod(AGE_LIMIT);
 
 	DEBUG_PRINT("Timers reset!");
 }
@@ -241,93 +309,8 @@ void print_frame(CAN_FRAME* frame) {  // this is good for testing to see if you 
 	Serial.print("\r\n");
 }
 
-bool is_pack_bad(const pack_t& d) {
-	if (d.current > CURRENT_LIMIT) {
-		DEBUG_PRINT("Pack current high!");
-		return true;
-	}
-	if ((millis() - d.timestamp) > AGE_LIMIT) {
-		DEBUG_PRINT("Pack data old!");
-		return true;
-	}
-
-	return false;
-}
-bool is_voltage_bad(const voltage_t& d) {
-	if (d.voltage > HIGH_VOLTAGE_LIMIT) {
-		DEBUG_PRINT("Module voltage high!");
-		DEBUG_PRINT(d.module_id);
-		return true;
-	}
-	if (d.voltage < LOW_VOLTAGE_LIMIT) {
-		DEBUG_PRINT("Module voltage low!");
-		DEBUG_PRINT(d.module_id);
-		return true;
-	}
-	if ((millis() - d.timestamp) > AGE_LIMIT) {
-		DEBUG_PRINT("Voltage data old!");
-		return true;
-	}
-
-	return false;
-}
-bool is_temp_bad(const temp_t& d) {
-	if (d.temp > TEMP_LIMIT) {
-		DEBUG_PRINT("Temp high!");
-		DEBUG_PRINT(d.therm_id);
-		return true;
-	}
-	if ((millis() - d.timestamp) > AGE_LIMIT) {
-		DEBUG_PRINT("Temp data old!");
-		return true;
-	}
-
-	return false;
-}
-
-/**
- *
- * pretty self explanitory
- *
- */
-void check_measurements() {
-	DEBUG_PRINT("Checking measurements...");
-	size_t error_count = 0;
-
-	error_count = std::count_if(pack_data, &pack_data[DATA_POINTS_TO_STORE - 1], is_pack_bad);
-	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
-		DEBUG_PRINT("Too many errors on pack!");
-		enter_error();
-	}
-
-	error_count = std::count_if(hv_data, &hv_data[DATA_POINTS_TO_STORE - 1], is_voltage_bad);
-	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
-		DEBUG_PRINT("Too many errors on overvoltage!");
-		enter_error();
-	}
-
-	error_count = std::count_if(lv_data, &lv_data[DATA_POINTS_TO_STORE - 1], is_voltage_bad);
-	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
-		DEBUG_PRINT("Too many errors on undervoltage!");
-		enter_error();
-	}
-	
-	error_count = std::count_if(temp_data, &temp_data[DATA_POINTS_TO_STORE - 1], is_temp_bad);
-	if (error_count > MAX_ACCEPTABLE_BAD_VALUES) {
-		DEBUG_PRINT("Too many errors on temp!");
-		enter_error();
-	}
-
-	DEBUG_PRINT("Done checking measurements!");
-}
-
 void setup() {
 	noInterrupts();  // disable interrupts for critical code
-#ifdef DEBUG_MODE
-	// Set up serial connection
-	Serial.begin(57600);
-	Serial.println("Hello world!");
-#endif
 
 	// Configure IO pins
 	pinMode(RELAY1_LOW_SIDE, OUTPUT);
@@ -337,14 +320,26 @@ void setup() {
 	pinMode(FAN_CONTROL_PIN, OUTPUT);
 	pinMode(PRECHARGE_SWITCH, INPUT_PULLUP);  // pin 11
 	pinMode(PRECHARGE_LED, OUTPUT);
+
+ #ifdef DEBUG_MODE
+ // Set up serial connection
+  Serial.begin(57600);
+  Serial.println("Hello world!");
+#endif
+
 	DEBUG_PRINT("Pins configured!");
+
+  
 
 	// Configure timers and interrupts
 	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_on_handler, FALLING);
 	attachInterrupt(digitalPinToInterrupt(PRECHARGE_SWITCH), flip_off_handler, RISING);
-	// DueTimer t = DueTimer(2);
 	Timer0.attachInterrupt(precharge_timer_handler).setPeriod(60000);  // 60 seconds for precharge timer
 	Timer1.attachInterrupt(blink_timer_handler).setPeriod(1000);	   // 1 second for led blink
+	Timer2.attachInterrupt(pack_watchdog_handler).setPeriod(AGE_LIMIT);
+	Timer3.attachInterrupt(voltage_watchdog_handler).setPeriod(AGE_LIMIT);
+	Timer4.attachInterrupt(temp_watchdog_handler).setPeriod(AGE_LIMIT);
+
 	DEBUG_PRINT("Interrupts configured!");
 
 	// Begin CAN connection
@@ -357,6 +352,8 @@ void setup() {
 	Can0.setCallback(0, temp_dtc_handler);
 
 	interrupts();  // enable interrupts
+
+	enter_precharge();
 }
 
 void loop() {
@@ -376,6 +373,4 @@ void loop() {
 		}
 	}
 #endif
-
-
 }

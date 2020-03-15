@@ -26,42 +26,20 @@ const uint8_t VEHICLE_FAULT = 0x00F; // Sends a message to alert that there is a
 
 // pins
 const uint8_t PRECHARGE_SWITCH = 11;
-const uint8_t PRECHARGE_LED = 52;
+const uint8_t PRECHARGE_LED = 31;
 const uint8_t FAN_CONTROL_PIN = 50;
-const uint8_t RELAY1_LOW_SIDE = 48;  
-const uint8_t RELAY2_HIGH_SIDE = 46;
-const uint8_t RELAY3_PRECHARGE = 44;
-const uint8_t RELAY4_MPPT = 42;
+const uint8_t RELAY1_LOW_SIDE = 53;  
+const uint8_t RELAY2_HIGH_SIDE = 51;
+const uint8_t RELAY3_PRECHARGE = 49;
+const uint8_t RELAY4_MPPT = 47;
 
-// measurements
-const size_t DATA_POINTS_TO_STORE = 5;
-const size_t MAX_ACCEPTABLE_BAD_VALUES = 1;
+
 // Absolute maximum ratings. TODO: FIll these out
 const uint16_t CURRENT_LIMIT = 0;
 const uint16_t HIGH_VOLTAGE_LIMIT = 0;
 const uint16_t LOW_VOLTAGE_LIMIT = 0;
 const uint16_t TEMP_LIMIT = 0;
-const uint32_t AGE_LIMIT = 0;  // no data can be older than this (in ms)
+const uint32_t AGE_LIMIT = 10000;  // no data can be older than this (in ms)
 
-// data from pack_status frame
-struct pack_t {
-	volatile uint16_t current;
-	volatile uint16_t voltage;
-	volatile uint8_t soc;
-	volatile uint16_t relay;
-	volatile uint32_t timestamp;
-};
 
-struct voltage_t {
-	volatile uint16_t voltage;
-	volatile uint8_t module_id;
-	volatile uint32_t timestamp;
-};
-
-struct temp_t {
-	volatile uint8_t temp;
-	volatile uint8_t therm_id;
-    volatile uint32_t timestamp;
-};
-
-#endif
+#endif*
